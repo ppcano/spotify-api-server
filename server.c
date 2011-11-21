@@ -34,6 +34,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include <string.h>
 #include <svn_diff.h>
 #include <sys/queue.h>
+#include <syslog.h>
 
 #include "constants.h"
 #include "diff.h"
@@ -46,18 +47,13 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 extern const unsigned char g_appkey[]; 
 extern const size_t g_appkey_size; 
 
-// Account information
+// Spotify account information
 extern const char username[];
 extern const char password[];
 
 static int exit_status = EXIT_FAILURE;
 
-// Spotify account information
-struct account {
-  char *username;
-  char *password;
-};
-
+// Application state
 struct state {
   sp_session *session;
 
@@ -81,6 +77,17 @@ struct playlist_handler {
   sp_playlist_callbacks *playlist_callbacks;
   struct evhttp_request *request;
   handle_playlist_fn callback;
+  void *userdata;
+};
+
+typedef void (*handle_playlistcontainer_fn)(sp_playlistcontainer *,
+                                            struct evhttp_request *,
+                                            void *);
+
+struct playlistcontainer_handler {
+  sp_playlistcontainer_callbacks *playlistcontainer_callbacks;
+  struct evhttp_request *request;
+  handle_playlistcontainer_fn callback;
   void *userdata;
 };
 
@@ -153,26 +160,53 @@ void playlist_dispatch(sp_playlist *playlist, void *userdata) {
   free(handler);
 }
 
-static void playlist_state_changed(sp_playlist *playlist, void *userdata) {
-  if (!sp_playlist_is_loaded(playlist))
-    return;
-
-  playlist_dispatch(playlist, userdata);
+static struct playlistcontainer_handler *register_playlistcontainer_callbacks(
+    sp_playlistcontainer *pc,
+    struct evhttp_request *request,
+    handle_playlistcontainer_fn callback,
+    sp_playlistcontainer_callbacks *playlistcontainer_callbacks,
+    void *userdata) {
+  struct playlistcontainer_handler *handler = malloc(sizeof (struct playlistcontainer_handler));
+  handler->request = request;
+  handler->callback = callback;
+  handler->playlistcontainer_callbacks = playlistcontainer_callbacks;
+  handler->userdata = userdata;
+  sp_playlistcontainer_add_callbacks(pc, handler->playlistcontainer_callbacks,
+                                     handler);
+  return handler;
 }
 
-static sp_playlist_callbacks playlist_state_changed_callbacks = {
-  .playlist_state_changed = &playlist_state_changed
-};
+void playlistcontainer_dispatch(sp_playlistcontainer *pc, void *userdata) {
+  struct playlistcontainer_handler *handler = userdata;
+  sp_playlistcontainer_remove_callbacks(pc,
+                                        handler->playlistcontainer_callbacks,
+                                        handler);
+  handler->callback(pc, handler->request, handler->userdata);
+  free(handler);
+}
 
-static void playlist_update_in_progress(sp_playlist *playlist,
-                                        bool done,
-                                        void *userdata) {
+static void playlist_dispatch_if_loaded(sp_playlist *playlist, void *userdata) {
+  if (sp_playlist_is_loaded(playlist))
+    playlist_dispatch(playlist, userdata);
+}
+
+static void playlist_dispatch_if_updated(sp_playlist *playlist,
+                                         bool done,
+                                         void *userdata) {
   if (done)
     playlist_dispatch(playlist, userdata);
 }
 
+static sp_playlist_callbacks playlist_state_changed_callbacks = {
+  .playlist_state_changed = &playlist_dispatch_if_loaded
+};
+
 static sp_playlist_callbacks playlist_update_in_progress_callbacks = {
-  .playlist_update_in_progress = &playlist_update_in_progress
+  .playlist_update_in_progress = &playlist_dispatch_if_updated
+};
+
+static sp_playlistcontainer_callbacks playlistcontainer_loaded_callbacks = {
+  .container_loaded = &playlistcontainer_dispatch
 };
 
 // HTTP handlers
@@ -271,6 +305,27 @@ static void inbox_post_complete(sp_inbox *inbox, void *userdata) {
       send_error_sp(request, HTTP_ERROR, inbox_error);
       break;
   }
+}
+
+static void get_user_playlists(sp_playlistcontainer *pc,
+                               struct evhttp_request *request,
+                               void *userdata) {
+  json_t *json = json_object();
+  json_t *playlists = json_array();
+  json_object_set_new(json, "playlists", playlists);
+
+  for (int i = 0; i < sp_playlistcontainer_num_playlists(pc); i++) {
+    sp_playlist *playlist = sp_playlistcontainer_playlist(pc, i);
+
+    if (!sp_playlist_is_loaded(playlist)) // TODO(liesen): Wait for it to load?
+      continue;
+
+    json_t *playlist_json = json_object();
+    playlist_to_json(playlist, playlist_json);
+    json_array_append_new(playlists, playlist_json);
+  }
+
+  send_reply_json(request, HTTP_OK, "OK", json);
 }
 
 static void put_user_inbox(const char *user,
@@ -427,7 +482,7 @@ static void put_playlist_add_tracks(sp_playlist *playlist,
     return;
   }
 
-  const sp_track **tracks = calloc(num_tracks, sizeof (sp_track *));
+  sp_track **tracks = calloc(num_tracks, sizeof (sp_track *));
   int num_valid_tracks = json_to_tracks(json, tracks, num_tracks);
   json_decref(json);
   
@@ -542,7 +597,7 @@ static void put_playlist_patch(sp_playlist *playlist,
     return;
   }
 
-  const sp_track **tracks = calloc(num_tracks, sizeof (sp_track *));
+  sp_track **tracks = calloc(num_tracks, sizeof (sp_track *));
   int num_valid_tracks = 0;
 
   for (int i = 0; i < num_tracks; i++) {
@@ -601,10 +656,6 @@ static void put_playlist_patch(sp_playlist *playlist,
                                                         num_valid_tracks,
                                                         state->session);
 
-  svn_stream_t *out;
-  svn_stream_for_stdout(&out, pool);
-  diff_output_stdout(out, diff, playlist, tracks, num_valid_tracks, pool);
-
   if (apply_error != SVN_NO_ERROR) {
     free(tracks);
     svn_handle_error2(apply_error, stderr, false, "Updating playlist");
@@ -621,6 +672,56 @@ static void put_playlist_patch(sp_playlist *playlist,
   free(tracks);
   register_playlist_callbacks(playlist, request, &get_playlist,
                               &playlist_update_in_progress_callbacks, NULL);
+}
+
+static void handle_user_request(struct evhttp_request *request,
+                                char *action,
+                                const char *canonical_username,
+                                sp_session *session) {
+  if (action == NULL) {
+    evhttp_send_error(request, HTTP_BADREQUEST, "Bad Request");
+    return;
+  }
+
+  int http_method = evhttp_request_get_command(request);
+
+  switch (http_method) {
+    case EVHTTP_REQ_GET:
+      if (strncmp(action, "playlists", 9) == 0) {
+        sp_playlistcontainer *pc = sp_session_publishedcontainer_for_user_create(
+            session, canonical_username);
+
+        if (sp_playlistcontainer_is_loaded(pc)) {
+          get_user_playlists(pc, request, session);
+        } else {
+          register_playlistcontainer_callbacks(pc, request,
+              &get_user_playlists,
+              &playlistcontainer_loaded_callbacks,
+              session);
+        }
+      } else if (strncmp(action, "starred", 7) == 0) {
+        sp_playlist *playlist = sp_session_starred_for_user_create(session,
+            canonical_username);
+
+        if (sp_playlist_is_loaded(playlist)) {
+          get_playlist(playlist, request, session);
+        } else {
+          register_playlist_callbacks(playlist, request, &get_playlist,
+              &playlist_state_changed_callbacks,
+              session);
+        }
+      }
+      break;
+
+    case EVHTTP_REQ_PUT:
+    case EVHTTP_REQ_POST:
+      if (strncmp(action, "inbox", 5) == 0) {
+        put_user_inbox(canonical_username, request, session);
+      }
+      break;
+  }
+
+  evhttp_send_error(request, HTTP_BADREQUEST, "Bad Request");
 }
 
 // Request dispatcher
@@ -658,35 +759,16 @@ static void handle_request(struct evhttp_request *request,
 
   // Handle requests to /user/<user_name>/inbox
   if (strncmp(entity, "user", 4) == 0) {
-    char *user = strtok(NULL, "/");
+    char *username = strtok(NULL, "/");
 
-    if (user == NULL) {
+    if (username == NULL) {
       evhttp_send_error(request, HTTP_BADREQUEST, "Bad Request");
       free(uri);
       return;
     }
 
     char *action = strtok(NULL, "/");
-
-    if (action == NULL) {
-      evhttp_send_error(request, HTTP_BADREQUEST, "Bad Request");
-      free(uri);
-      return;
-    }
-
-    switch (http_method) {
-      case EVHTTP_REQ_PUT:
-      case EVHTTP_REQ_POST:
-        if (strncmp(action, "inbox", 5) == 0) {
-          put_user_inbox(user, request, session);
-        }
-        break;
-
-      default:
-        evhttp_send_error(request, HTTP_BADREQUEST, "Bad Request");
-        break;
-    }
-
+    handle_user_request(request, action, username, session);
     free(uri);
     return;
   }
@@ -800,7 +882,7 @@ static sp_playlistcontainer_callbacks playlistcontainer_callbacks = {
 };
 
 static void playlistcontainer_loaded(sp_playlistcontainer *pc, void *userdata) {
-  fprintf(stderr, "playlistcontainer_loaded\n");
+  syslog(LOG_DEBUG, "playlistcontainer_loaded\n");
   sp_session *session = userdata;
   struct state *state = sp_session_userdata(session);
 
@@ -812,7 +894,7 @@ static void playlistcontainer_loaded(sp_playlistcontainer *pc, void *userdata) {
 
   // TODO(liesen): Make address and port configurable
   if (evhttp_bind_socket(state->http, "0.0.0.0", 1337) == -1) {
-    fprintf(stderr, "fail\n");
+    syslog(LOG_WARNING, "Could not bind HTTP server socket");
     sp_session_logout(session);
   }
 }
@@ -821,25 +903,27 @@ static void playlistcontainer_loaded(sp_playlistcontainer *pc, void *userdata) {
 static void sigint_handler(evutil_socket_t socket,
                            short what,
                            void *userdata) {
-  fprintf(stderr, "signal_handler\n");
+  syslog(LOG_DEBUG, "signal_handler\n");
   struct state *state = userdata;
   sp_session_logout(state->session);
 }
 
 static void logged_out(sp_session *session) {
-  fprintf(stderr, "logged_out\n");
+  syslog(LOG_DEBUG, "logged_out\n");
   struct state *state = sp_session_userdata(session);
   event_del(state->async);
   event_del(state->timer);
   event_del(state->sigint);
   event_base_loopbreak(state->event_base);
   apr_pool_destroy(state->pool);
+  closelog();
 }
 
 
 static void logged_in(sp_session *session, sp_error error) {
   if (error != SP_ERROR_OK) {
-    fprintf(stderr, "%s\n", sp_error_message(error));
+    syslog(LOG_CRIT, "Error logging in to Spotify: %s",
+           sp_error_message(error));
     exit_status = EXIT_FAILURE;
     logged_out(session);
     return;
@@ -871,16 +955,14 @@ static void process_events(evutil_socket_t socket,
 }
 
 static void notify_main_thread(sp_session *session) {
-  fprintf(stderr, "notify_main_thread\n");
+  syslog(LOG_DEBUG, "notify_main_thread\n");
   struct state *state = sp_session_userdata(session);
   event_active(state->async, 0, 1);
 }
 
 int main(int argc, char **argv) {
-  struct account account = {
-    .username = username,
-    .password = password
-  };
+  // Open syslog
+  openlog("spotify-api-server", LOG_CONS | LOG_PID | LOG_NDELAY, LOG_LOCAL1);
 
   // Initialize program state
   struct state *state = malloc(sizeof(struct state));
@@ -896,8 +978,10 @@ int main(int argc, char **argv) {
   // Initialize APR
   apr_status_t rv = apr_initialize();
 
-  if (rv != APR_SUCCESS)
+  if (rv != APR_SUCCESS) {
+    syslog(LOG_CRIT, "Unable to initialize APR");
     return EXIT_FAILURE;
+  }
 
   apr_pool_create(&state->pool, NULL);
 
@@ -925,11 +1009,14 @@ int main(int argc, char **argv) {
   sp_error session_create_error = sp_session_create(&session_config,
                                                     &session);
 
-  if (session_create_error != SP_ERROR_OK)
+  if (session_create_error != SP_ERROR_OK) {
+    syslog(LOG_CRIT, "Error creating Spotify session: %s",
+           sp_error_message(session_create_error));
     return EXIT_FAILURE;
+  }
 
   // Log in to Spotify
-  sp_session_login(session, account.username, account.password);
+  sp_session_login(session, username, password, false);
 
   event_base_dispatch(state->event_base);
 
