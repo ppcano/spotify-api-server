@@ -321,7 +321,9 @@ static void get_user_playlists(sp_playlistcontainer *pc,
       continue;
 
     json_t *playlist_json = json_object();
-    playlist_to_json(playlist, playlist_json);
+
+    sp_session *session = userdata;
+    playlist_to_json(playlist, playlist_json, session);
     json_array_append_new(playlists, playlist_json);
   }
 
